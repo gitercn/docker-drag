@@ -8,16 +8,19 @@ import shutil
 import requests
 import tarfile
 import urllib3
+import argparse
 urllib3.disable_warnings()
 
-if len(sys.argv) != 2 :
-	print('Usage:\n\tdocker_pull.py [registry/][repository/]image[:tag|@digest]\n')
-	exit(1)
+parser = argparse.ArgumentParser(description='Pull Docker images without a Docker daemon by directly interacting with the registry API.')
+parser.add_argument('image', help='The Docker image to pull, e.g., "ubuntu:latest" or "hello-world@<digest>"')
+parser.add_argument('--platform', help='Set platform to pull a specific architecture, e.g., "linux/amd64" or "arm64"')
+args = parser.parse_args()
+
 
 # Look for the Docker image to download
 repo = 'library'
 tag = 'latest'
-imgparts = sys.argv[1].split('/')
+imgparts = args.image.split('/')
 try:
     img,tag = imgparts[-1].split('@')
 except ValueError:
@@ -69,22 +72,119 @@ def progress_bar(ublob, nb_traits):
 	sys.stdout.flush()
 
 # Fetch manifest v2 and get image layer digests
-auth_head = get_auth_head('application/vnd.docker.distribution.manifest.v2+json')
+# First, try to get a manifest list or a single manifest
+auth_head = get_auth_head('application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.docker.distribution.manifest.v2+json')
 resp = requests.get('https://{}/v2/{}/manifests/{}'.format(registry, repository, tag), headers=auth_head, verify=False)
-if (resp.status_code != 200):
-	print('[-] Cannot fetch manifest for {} [HTTP {}]'.format(repository, resp.status_code))
-	print(resp.content)
-	auth_head = get_auth_head('application/vnd.docker.distribution.manifest.list.v2+json')
-	resp = requests.get('https://{}/v2/{}/manifests/{}'.format(registry, repository, tag), headers=auth_head, verify=False)
-	if (resp.status_code == 200):
-		print('[+] Manifests found for this tag (use the @digest format to pull the corresponding image):')
-		manifests = resp.json()['manifests']
-		for manifest in manifests:
-			for key, value in manifest["platform"].items():
-				sys.stdout.write('{}: {}, '.format(key, value))
-			print('digest: {}'.format(manifest["digest"]))
-	exit(1)
-layers = resp.json()['layers']
+
+if resp.status_code != 200:
+    print('[-] Cannot fetch manifest for {} [HTTP {}]'.format(repository, resp.status_code))
+    print(resp.content)
+    exit(1)
+
+manifest_data = resp.json()
+
+# Handle manifest list (multi-architecture)
+if 'manifests' in manifest_data:
+    manifests = manifest_data['manifests']
+    
+    # If --platform is specified, find the matching digest
+    if args.platform:
+        # Platform string parsing for "os/arch/variant", "os/arch", or "arch"
+        parts = args.platform.split('/')
+        req_os, req_arch, req_variant = None, None, None
+        if len(parts) == 1:
+            req_arch = parts[0]
+        elif len(parts) == 2:
+            req_os, req_arch = parts
+        elif len(parts) >= 3:
+            req_os, req_arch, req_variant = parts[:3]
+
+        # If os is not specified, default to linux
+        if req_os is None:
+            req_os = 'linux'
+
+        matching_manifests = []
+        for manifest in manifests:
+            plat = manifest.get('platform', {})
+            arch = plat.get('architecture')
+            manifest_os = plat.get('os')
+            variant = plat.get('variant')
+            
+            # Match required fields. A specified field must match.
+            if manifest_os != req_os or arch != req_arch:
+                continue
+
+            # If variant is specified, it must match. If not specified, we accept any variant.
+            if req_variant is not None and req_variant != variant:
+                continue
+            
+            matching_manifests.append(manifest)
+        
+        if len(matching_manifests) == 0:
+            print(f'[-] Could not find a manifest for platform: {args.platform}')
+            print('[i] Available platforms are:')
+            for manifest in manifests:
+                plat = manifest.get("platform", {})
+                platform_info = ', '.join([f'{key}: {value}' for key, value in plat.items()])
+                
+                # Construct the platform string for the --platform argument
+                platform_arg_parts = []
+                if plat.get('os'): platform_arg_parts.append(plat.get('os'))
+                if plat.get('architecture'): platform_arg_parts.append(plat.get('architecture'))
+                if plat.get('variant'): platform_arg_parts.append(plat.get('variant'))
+                platform_arg_str = '/'.join(platform_arg_parts)
+
+                print(f'  --platform {platform_arg_str:<30} # {platform_info} (digest: {manifest["digest"]})')
+            exit(1)
+
+        elif len(matching_manifests) > 1:
+            print(f'[!] Ambiguous platform: --platform {args.platform} matches multiple images.')
+            print(f'[i] Please select one by re-running the command with its specific digest, e.g.:')
+            print(f'    python docker_pull.py {args.image}@<digest>')
+            print('[i] Conflicting manifests are:')
+            for manifest in matching_manifests:
+                platform_info = ', '.join([f'{key}: {value}' for key, value in manifest.get("platform", {}).items()])
+                print(f'  - {platform_info} (digest: {manifest["digest"]})')
+            exit(1)
+            
+        else: # Exactly one match
+            digest = matching_manifests[0]['digest']
+            print(f'[+] Found unique digest for platform {args.platform}: {digest}')
+            
+            # Re-fetch the specific manifest using its digest
+            auth_head = get_auth_head('application/vnd.docker.distribution.manifest.v2+json')
+            resp = requests.get('https://{}/v2/{}/manifests/{}'.format(registry, repository, digest), headers=auth_head, verify=False)
+            if resp.status_code != 200:
+                print(f'[-] Failed to fetch manifest for digest {digest} [HTTP {resp.status_code}]')
+                print(resp.content)
+                exit(1)
+            manifest_data = resp.json()
+
+    # If --platform is NOT specified for a multi-arch image, print list and exit
+    else:
+        print('[+] This is a multi-architecture image. Please specify a platform using the --platform argument.')
+        print('[i] Available platforms are:')
+        for manifest in manifests:
+            plat = manifest.get("platform", {})
+            platform_info = ', '.join([f'{key}: {value}' for key, value in plat.items()])
+
+            # Construct the platform string for the --platform argument
+            platform_arg_parts = []
+            if plat.get('os'): platform_arg_parts.append(plat.get('os'))
+            if plat.get('architecture'): platform_arg_parts.append(plat.get('architecture'))
+            if plat.get('variant'): platform_arg_parts.append(plat.get('variant'))
+            platform_arg_str = '/'.join(platform_arg_parts)
+
+            print(f'  --platform {platform_arg_str:<30} # {platform_info} (digest: {manifest["digest"]})')
+        exit(1)
+
+# At this point, manifest_data should be a single-architecture manifest
+if 'layers' not in manifest_data:
+    print(f'[-] Unexpected manifest format for {repository}. Expected a single manifest but got something else.')
+    print(resp.text)
+    exit(1)
+
+layers = manifest_data['layers']
 
 # Create tmp folder that will hold the image
 imgdir = 'tmp_{}_{}'.format(img, tag.replace(':', '@'))
